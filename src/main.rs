@@ -343,6 +343,8 @@ fn main() {
         }
     }
 
+    let start = std::time::Instant::now();
+
     let mut stats = Stats::new();
     // Stack for keeping track of picked pieces
     let mut picks = vec![(0, 0); NUM_PIECES];
@@ -350,6 +352,10 @@ fn main() {
     search(0, 0, &bit_map, &mut picks, &mut stats, &mut solutions);
 
     println!("Found {} solutions", solutions.len());
+    println!(
+        "Took {} seconds",
+        (std::time::Instant::now() - start).as_secs_f64()
+    );
     println!();
     for (i, solution) in solutions.iter().enumerate() {
         println!("Solution {}", i);
