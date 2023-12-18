@@ -1,3 +1,6 @@
+use std::hash::Hash;
+use std::io::Write;
+
 const CUBE_SIZE: usize = 4;
 const CUBE_NUM_BITS: usize = CUBE_SIZE * CUBE_SIZE * CUBE_SIZE;
 const NUM_PIECES: usize = 13;
@@ -9,6 +12,9 @@ enum Axis {
 }
 
 struct Coords(usize, usize, usize);
+
+#[derive(Default, Clone)]
+struct Solution([u64; NUM_PIECES]);
 
 fn pack_bit(b: bool, x: usize, y: usize, z: usize) -> u64 {
     (b as u64) << (x * 16 + y * 4 + z)
@@ -34,6 +40,15 @@ impl BlockIndex<Coords> for &[[[bool; 4]; 4]; 4] {
     }
 }
 
+/// Quick and dirty hash for a solution
+fn hash_solution(solution: &Solution) -> u64 {
+    let mut h = 0;
+    for p in 0..NUM_PIECES {
+        h ^= solution.0[p] << p;
+    }
+    h
+}
+
 fn print<T>(block: T)
 where
     T: BlockIndex<Coords>,
@@ -56,17 +71,21 @@ where
     }
 }
 
-fn print_solution(picks: &[(usize, u64)]) {
+// Write a solution to stream
+fn write_solution(
+    picks: &Solution,
+    stream: &mut impl std::io::Write,
+) -> Result<(), std::io::Error> {
     // Labels for pieces: A, B, C, ...
     let mut arr = [[['0'; 4]; 4]; 4];
 
-    for (piece, placement) in picks.iter() {
-        let label = (*piece as u8 + b'A') as char;
+    for p in 0..NUM_PIECES {
+        let label = (p as u8 + b'A') as char;
 
         for z in 0..4 {
             for y in 0..4 {
                 for x in 0..4 {
-                    if placement.index(Coords(x, y, z)) {
+                    if unpack_bit(picks.0[p], x, y, z) {
                         arr[z][y][x] = label;
                     }
                 }
@@ -77,12 +96,15 @@ fn print_solution(picks: &[(usize, u64)]) {
     for z in 0..4 {
         for y in 0..4 {
             for x in 0..4 {
-                print!("{}", arr[z][y][x]);
+                write!(stream, "{}", arr[z][y][x])?;
             }
-            print!("    ");
+            if y != 3 {
+                write!(stream, "    ")?;
+            }
         }
-        println!();
+        writeln!(stream)?;
     }
+    Ok(())
 }
 
 /// Read pieces from file
@@ -267,20 +289,21 @@ fn search(
     state: u64,
     used_pieces: u64,
     bit_map: &Vec<Vec<Vec<u64>>>,
-    picks: &mut Vec<(usize, u64)>,
+    picks: &mut [u64; NUM_PIECES],
     stats: &mut Stats,
-    solutions: &mut Vec<Vec<(usize, u64)>>,
+    solutions: &mut Vec<Solution>,
 ) {
     stats.print();
     if used_pieces.count_ones() == NUM_PIECES as u32 {
         // Slows down things quite a lot, but prints each solution
         // print_solution(picks);
         // println!();
-        solutions.push(picks.clone());
+        solutions.push(Solution(picks.clone()));
         stats.success();
         return;
     }
 
+    // Find first empty bit in the cube, starting from the least significant bit (first x=0)
     let bit_index = state.trailing_ones() as usize;
 
     // For each piece that fits this bit, recurse
@@ -290,7 +313,7 @@ fn search(
         }
         for permutation in bit_map[bit_index][piece].iter() {
             if (*permutation & state) == 0 {
-                picks.push((piece, *permutation));
+                picks[piece] = *permutation;
                 search(
                     state | *permutation,
                     used_pieces | 1 << piece,
@@ -299,11 +322,48 @@ fn search(
                     stats,
                     solutions,
                 );
-                picks.pop();
             }
         }
     }
     stats.fail();
+}
+
+/// Returns a filtered version of the solutions with only unique solutions
+fn filter_unique_solutions(solutions: &Vec<Solution>) -> Vec<Solution> {
+    let mut unique_solutions = Vec::new();
+
+    // All seen solutions
+    let mut hashes = std::collections::HashSet::new();
+    for solution in solutions {
+        if !hashes.insert(hash_solution(&solution)) {
+            // Already seen this solution
+            continue;
+        }
+
+        // Add this solution and any (rotated) permutations of it to the set of seen solutions
+        unique_solutions.push(solution.clone());
+
+        let mut solution = solution.clone();
+        for _ in 0..4 {
+            for _ in 0..4 {
+                for _ in 0..4 {
+                    for p in 0..NUM_PIECES {
+                        solution.0[p] = rotate_piece_90(solution.0[p], Axis::X);
+                    }
+                    hashes.insert(hash_solution(&solution));
+                }
+                for p in 0..NUM_PIECES {
+                    solution.0[p] = rotate_piece_90(solution.0[p], Axis::Y);
+                }
+                hashes.insert(hash_solution(&solution));
+            }
+            for p in 0..NUM_PIECES {
+                solution.0[p] = rotate_piece_90(solution.0[p], Axis::Z);
+            }
+            hashes.insert(hash_solution(&solution));
+        }
+    }
+    unique_solutions
 }
 
 fn main() {
@@ -346,20 +406,29 @@ fn main() {
     let start = std::time::Instant::now();
 
     let mut stats = Stats::new();
-    // Stack for keeping track of picked pieces
-    let mut picks = vec![(0, 0); NUM_PIECES];
+    // Keeping track of picked pieces
+    let mut picks = [0_u64; NUM_PIECES];
     let mut solutions = Vec::new();
     search(0, 0, &bit_map, &mut picks, &mut stats, &mut solutions);
 
-    println!("Found {} solutions", solutions.len());
+    // Filter out unique solutions
+    let unique_solutions = filter_unique_solutions(&solutions);
+
+    println!("Found {} unique solutions", unique_solutions.len());
     println!(
         "Took {} seconds",
         (std::time::Instant::now() - start).as_secs_f64()
     );
-    println!();
-    for (i, solution) in solutions.iter().enumerate() {
-        println!("Solution {}", i);
-        print_solution(solution);
-        println!();
+
+    //Write solutions to file
+    let mut file = std::fs::File::create("solutions.txt").expect("Failed to create file");
+    for (i, solution) in unique_solutions.iter().enumerate() {
+        let write_fn = |file: &mut std::fs::File| -> Result<(), std::io::Error> {
+            writeln!(file, "Solution #{}", i)?;
+            write_solution(solution, file)?;
+            writeln!(file)?;
+            Ok(())
+        };
+        write_fn(&mut file).expect("Failed to write to file");
     }
 }
